@@ -60,13 +60,15 @@ class RolloutStorage:
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
         # For reinforcement learning
-        if training_type == "rl":
+        if training_type in {"rl", "rl_genpo"}:
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-            self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            # Only PPO-style methods require old policy mean/std snapshots.
+            if training_type == "rl":
+                self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+                self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
         # For RNN networks
         self.saved_hidden_state_a = None
@@ -91,11 +93,12 @@ class RolloutStorage:
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
 
         # For reinforcement learning
-        if self.training_type == "rl":
+        if self.training_type in {"rl", "rl_genpo"}:
             self.values[self.step].copy_(transition.values)
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
-            self.mu[self.step].copy_(transition.action_mean)
-            self.sigma[self.step].copy_(transition.action_sigma)
+            if self.training_type == "rl":
+                self.mu[self.step].copy_(transition.action_mean)
+                self.sigma[self.step].copy_(transition.action_sigma)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -160,7 +163,7 @@ class RolloutStorage:
 
     # For reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
-        if self.training_type != "rl":
+        if self.training_type not in {"rl", "rl_genpo"}:
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
@@ -175,8 +178,9 @@ class RolloutStorage:
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
-        old_mu = self.mu.flatten(0, 1)
-        old_sigma = self.sigma.flatten(0, 1)
+        if self.training_type == "rl":
+            old_mu = self.mu.flatten(0, 1)
+            old_sigma = self.sigma.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -192,33 +196,49 @@ class RolloutStorage:
                 returns_batch = returns[batch_idx]
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
                 advantages_batch = advantages[batch_idx]
-                old_mu_batch = old_mu[batch_idx]
-                old_sigma_batch = old_sigma[batch_idx]
+                if self.training_type == "rl":
+                    old_mu_batch = old_mu[batch_idx]
+                    old_sigma_batch = old_sigma[batch_idx]
 
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
                 masks_batch = None
 
                 # Yield the mini-batch
-                yield (
-                    obs_batch,
-                    actions_batch,
-                    target_values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_mu_batch,
-                    old_sigma_batch,
-                    (
-                        hidden_state_a_batch,
-                        hidden_state_c_batch,
-                    ),
-                    masks_batch,
-                )
+                if self.training_type == "rl":
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        target_values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        old_mu_batch,
+                        old_sigma_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                    )
+                else:  # rl_genpo
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        target_values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                    )
 
     # For reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
-        if self.training_type != "rl":
+        if self.training_type not in {"rl", "rl_genpo"}:
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
 
@@ -239,8 +259,9 @@ class RolloutStorage:
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
                 obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
                 actions_batch = self.actions[:, start:stop]
-                old_mu_batch = self.mu[:, start:stop]
-                old_sigma_batch = self.sigma[:, start:stop]
+                if self.training_type == "rl":
+                    old_mu_batch = self.mu[:, start:stop]
+                    old_sigma_batch = self.sigma[:, start:stop]
                 returns_batch = self.returns[:, start:stop]
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
@@ -272,20 +293,35 @@ class RolloutStorage:
                 )
 
                 # Yield the mini-batch
-                yield (
-                    obs_batch,
-                    actions_batch,
-                    values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_mu_batch,
-                    old_sigma_batch,
-                    (
-                        hidden_state_a_batch,
-                        hidden_state_c_batch,
-                    ),
-                    masks_batch,
-                )
+                if self.training_type == "rl":
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        old_mu_batch,
+                        old_sigma_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                    )
+                else:  # rl_genpo
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                    )
 
                 first_traj = last_traj

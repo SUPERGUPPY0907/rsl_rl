@@ -6,6 +6,11 @@
 """Implementation of different learning algorithms."""
 
 from .distillation import Distillation
+from .genpo import GenPO
+from .leapfrogppo import LeapfrogPPO
 from .ppo import PPO
+from .ppo_moser import MoserPPO
+from .sgenpo import SGenPO
+from .spo import SPO
 
-__all__ = ["PPO", "Distillation"]
+__all__ = ["PPO", "SPO", "GenPO", "SGenPO", "LeapfrogPPO", "MoserPPO", "Distillation"]

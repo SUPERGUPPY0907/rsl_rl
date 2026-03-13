@@ -14,7 +14,7 @@ from collections import deque
 from tensordict import TensorDict
 
 import rsl_rl
-from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms import PPO, SPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
@@ -392,7 +392,7 @@ class OnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO:
+    def _construct_algorithm(self, obs: TensorDict) -> PPO | SPO:
         """Construct the actor-critic algorithm."""
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -420,7 +420,7 @@ class OnPolicyRunner:
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        alg: PPO | SPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         # Initialize the storage
         alg.init_storage(
