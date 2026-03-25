@@ -8,8 +8,6 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
-from torch.func import jacrev, vmap
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -127,11 +125,6 @@ class Flow(nn.Module):
             activation=activation,
         )
 
-        self.dist = Normal(
-            torch.zeros(self.a_dim * 2, device=device),
-            torch.ones(self.a_dim * 2, device=device),
-        )
-
         time_layers: list[nn.Module] = [SinusoidalPosEmb(time_dim)]
         in_dim = time_dim
         for hidden_dim in time_hidden_dim:
@@ -140,6 +133,16 @@ class Flow(nn.Module):
             in_dim = hidden_dim
         time_layers.append(nn.Linear(in_dim, time_dim))
         self.time_mlp = nn.Sequential(*time_layers)
+
+    def _standard_gaussian_log_prob(self, latent: torch.Tensor) -> torch.Tensor:
+        latent_sq_norm = latent.square().sum(dim=-1)
+        return -0.5 * latent_sq_norm - self.a_dim * math.log(2.0 * math.pi)
+
+    def sample_with_latent(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        num_envs = observations.shape[0]
+        latent = torch.randn(num_envs, self.a_dim * 2, device=self.device)
+        action_aug = self._heun_method(observations, latent)
+        return action_aug, latent
 
     def _heun_method(self, observations: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         observations = observations.unsqueeze(0) if observations.dim() == 1 else observations
@@ -185,34 +188,21 @@ class Flow(nn.Module):
         out = torch.cat([z, y], dim=-1)
         return out.squeeze(0)
 
-    def forward(self, observations: torch.Tensor, jac: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-        num_envs = observations.shape[0]
-
-        action_aug_0 = torch.randn(num_envs, self.a_dim * 2, device=self.device)
-        log_probs = self.dist.log_prob(action_aug_0).sum(dim=-1)
-        action_aug = self._heun_method(observations, action_aug_0)
-
-        if jac:
-            jacobian_fn = jacrev(self._heun_method, argnums=1)
-            batched_jacobian_fn = vmap(jacobian_fn, in_dims=(0, 0))
-            j = batched_jacobian_fn(observations, action_aug_0)
-            log_probs = log_probs - torch.log(torch.abs(torch.linalg.det(j)) + 1.0e-8)
-
+    def forward(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        action_aug, action_aug_0 = self.sample_with_latent(observations)
+        log_probs = self._standard_gaussian_log_prob(action_aug_0)
         return action_aug, log_probs
 
     def inference(self, observations: torch.Tensor) -> torch.Tensor:
         num_envs = observations.shape[0]
         action_aug_0 = torch.randn(num_envs, self.a_dim * 2, device=self.device)
+        # action_aug_0 = torch.zeros(num_envs, self.a_dim * 2, device=self.device)
         return self._heun_method(observations, action_aug_0)
 
-    def inverse(self, observations: torch.Tensor, action_aug: torch.Tensor, jac: bool = False) -> torch.Tensor:
+    def inverse(self, observations: torch.Tensor, action_aug: torch.Tensor) -> torch.Tensor:
         action_aug_0 = self._heun_method_inverse(observations, action_aug)
-        log_probs = self.dist.log_prob(action_aug_0).sum(dim=-1)
-
-        if jac:
-            jacobian_fn = jacrev(self._heun_method_inverse, argnums=1)
-            batched_jacobian_fn = vmap(jacobian_fn, in_dims=(0, 0))
-            j = batched_jacobian_fn(observations, action_aug)
-            log_probs = log_probs + torch.log(torch.abs(torch.linalg.det(j)) + 1.0e-8)
-
+        log_probs = self._standard_gaussian_log_prob(action_aug_0)
         return log_probs
+
+    def inverse_latent(self, observations: torch.Tensor, action_aug: torch.Tensor) -> torch.Tensor:
+        return self._heun_method_inverse(observations, action_aug)

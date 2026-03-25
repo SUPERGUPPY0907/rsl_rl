@@ -154,10 +154,12 @@ class ActorCritic(nn.Module):
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        if self.state_dependent_std:
-            return self.actor(obs)[..., 0, :]
-        else:
-            return self.actor(obs)
+        self._update_distribution(obs)
+        return self.distribution.sample()
+        # if self.state_dependent_std:
+        #     return self.actor(obs)[..., 0, :]
+        # else:
+        #     return self.actor(obs)
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_critic_obs(obs)

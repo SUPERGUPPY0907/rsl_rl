@@ -105,7 +105,7 @@ class ActorCriticGenPO(nn.Module):
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
         self.ip_std = std
-        self.last_log_probs: torch.Tensor | None = None
+        self.last_latents: torch.Tensor | None = None
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
@@ -128,20 +128,30 @@ class ActorCriticGenPO(nn.Module):
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        actions, log_probs = self.actor(actor_obs, jac=False)
-        self.last_log_probs = log_probs
+        actions, latents = self.actor.sample_with_latent(actor_obs)
+        self.last_latents = latents
         return actions
     
     def inverse(self, actions: torch.tensor, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        log_probs = self.actor.inverse(actor_obs, actions, jac=False)
+        log_probs = self.actor.inverse(actor_obs, actions)
         return log_probs
 
+    def inverse_latent(self, actions: torch.Tensor, obs: TensorDict) -> torch.Tensor:
+        actor_obs = self.get_actor_obs(obs)
+        actor_obs = self.actor_obs_normalizer(actor_obs)
+        return self.actor.inverse_latent(actor_obs, actions)
+
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        if self.last_log_probs is None:
-            raise ValueError("No log_probs stored. Call act() first.")
-        return self.last_log_probs
+        if self.last_latents is None:
+            raise ValueError("No latents stored. Call act() first.")
+        return self.actor._standard_gaussian_log_prob(self.last_latents)
+
+    def get_actions_latent(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.last_latents is None:
+            raise ValueError("No latents stored. Call act() first.")
+        return self.last_latents
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         actor_obs = self.get_actor_obs(obs)

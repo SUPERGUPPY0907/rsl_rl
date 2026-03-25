@@ -11,7 +11,7 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import GenPO, PPO, SGenPO
+from rsl_rl.algorithms import GenPO, GenPOPlusPlus, PPO, SGenPO
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticGenPO,
@@ -25,7 +25,15 @@ from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 class OnPolicyFlowRunner(OnPolicyRunner):
     """On-policy runner with flow-aware algorithm/policy construction."""
 
-    def _construct_algorithm(self, obs: TensorDict) -> GenPO | SGenPO:
+    _alg_registry = {
+        "GenPO": GenPO,
+        "SGenPO": SGenPO,
+        "GenPOPlusPlus": GenPOPlusPlus,
+        "GenPO++": GenPOPlusPlus,
+        "genpo++": GenPOPlusPlus,
+    }
+
+    def _construct_algorithm(self, obs: TensorDict) -> GenPO | SGenPO | GenPOPlusPlus:
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
 
@@ -51,8 +59,12 @@ class OnPolicyFlowRunner(OnPolicyRunner):
         ).to(self.device)
 
         # Initialize the algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: GenPO | SGenPO = alg_class(
+        alg_name = self.alg_cfg.pop("class_name")
+        alg_class = self._alg_registry.get(alg_name)
+        if alg_class is None:
+            alg_class = eval(alg_name)
+
+        alg: GenPO | SGenPO | GenPOPlusPlus = alg_class(
             actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 

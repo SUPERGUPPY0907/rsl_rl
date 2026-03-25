@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -124,6 +125,15 @@ class GenPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
+    def _latent_sq_norm(self, latent: torch.Tensor) -> torch.Tensor:
+        return latent.square().sum(dim=-1)
+
+    def _log_ratio_from_latents(self, new_latent: torch.Tensor, old_latent: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (self._latent_sq_norm(old_latent) - self._latent_sq_norm(new_latent))
+
+    def _log_prob_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        return -0.5 * self._latent_sq_norm(latent) - 0.5 * latent.shape[-1] * math.log(2.0 * math.pi)
+
     def get_storage_action_shape(self, num_env_actions: int) -> list[int]:
         return [num_env_actions * 2]
 
@@ -155,7 +165,7 @@ class GenPO:
         actions_full = self.policy.act(obs).detach()
         self.transition.actions = actions_full
         self.transition.values = self.policy.evaluate(obs).detach()
-        self.transition.actions_log_prob = self.policy.get_actions_log_prob(actions_full).detach()
+        self.transition.action_latent = self.policy.get_actions_latent(actions_full).detach()
         self.transition.observations = obs
 
         return 0.5 * actions_full[..., : self.policy.action_dim] + 0.5 * actions_full[..., self.policy.action_dim :]
@@ -216,7 +226,7 @@ class GenPO:
             target_values_batch,
             advantages_batch,
             returns_batch,
-            old_actions_log_prob_batch,
+            old_action_latent_batch,
             hidden_states_batch,
             masks_batch,
         ) in generator:
@@ -236,21 +246,20 @@ class GenPO:
                     env=self.symmetry["_env"],
                 )
                 num_aug = int(obs_batch.batch_size[0] / original_batch_size)
-                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
+                old_action_latent_batch = old_action_latent_batch.repeat(num_aug, 1)
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: We need to do this because we updated the policy with the new parameters
-            actions_log_prob_batch = self.policy.inverse(actions_batch, obs_batch, jac=False)
+            new_action_latent_batch = self.policy.inverse_latent(actions_batch, obs_batch)
+            log_ratio_batch = self._log_ratio_from_latents(new_action_latent_batch, old_action_latent_batch)
             # -- critic
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
             
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
-                    kl  = torch.squeeze(old_actions_log_prob_batch) - actions_log_prob_batch
+                    kl = -log_ratio_batch
                     kl_mean = torch.mean(kl)
 
                     # Reduce the KL divergence across all GPUs
@@ -278,7 +287,7 @@ class GenPO:
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            ratio = torch.exp(log_ratio_batch)
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
@@ -304,7 +313,8 @@ class GenPO:
             else: 
                 compress_loss = surrogate_loss.new_zeros(())
 
-            entropy = -((actions_log_prob_batch).detach() * actions_log_prob_batch).mean()
+            action_log_prob_batch = self._log_prob_from_latent(new_action_latent_batch)
+            entropy = -((action_log_prob_batch).detach() * action_log_prob_batch).mean()
             
             loss = surrogate_loss + self.value_loss_coef * value_loss + self.compress_coef * compress_loss
 

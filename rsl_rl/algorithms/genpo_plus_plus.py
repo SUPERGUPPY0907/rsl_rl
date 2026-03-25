@@ -7,21 +7,121 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from tensordict import TensorDict
 
 from rsl_rl.algorithms.genpo import GenPO
 
 
-class SGenPO(GenPO):
-    """GenPO variant with SPO-style policy surrogate."""
+class GenPOPlusPlus(GenPO):
+    """GenPO variant with latent directional diversity regularization."""
+
+    def __init__(
+        self,
+        policy,
+        lambda_dir: float = 0.0,
+        directional_num_samples: int = 4,
+        directional_advantage_quantile: float = 0.75,
+        directional_max_groups: int = 32,
+        directional_eps: float = 1.0e-8,
+        **kwargs,
+    ) -> None:
+        super().__init__(policy, **kwargs)
+
+        if lambda_dir < 0.0:
+            raise ValueError(f"'lambda_dir' must be non-negative, got {lambda_dir}.")
+        if directional_num_samples < 2:
+            raise ValueError(
+                f"'directional_num_samples' must be at least 2, got {directional_num_samples}."
+            )
+        if not 0.0 <= directional_advantage_quantile <= 1.0:
+            raise ValueError(
+                "'directional_advantage_quantile' must be in [0, 1], "
+                f"got {directional_advantage_quantile}."
+            )
+        if directional_max_groups < 1:
+            raise ValueError(f"'directional_max_groups' must be positive, got {directional_max_groups}.")
+        if directional_eps <= 0.0:
+            raise ValueError(f"'directional_eps' must be positive, got {directional_eps}.")
+
+        self.lambda_dir = lambda_dir
+        self.directional_num_samples = directional_num_samples
+        self.directional_advantage_quantile = directional_advantage_quantile
+        self.directional_max_groups = directional_max_groups
+        self.directional_eps = directional_eps
+
+    def _repeat_observations(self, obs: TensorDict, repeats: int) -> TensorDict:
+        if repeats < 1:
+            raise ValueError(f"'repeats' must be positive, got {repeats}.")
+
+        repeated_obs = {key: value.repeat_interleave(repeats, dim=0) for key, value in obs.items()}
+        return TensorDict(repeated_obs, batch_size=[obs.batch_size[0] * repeats], device=obs.device)
+
+    def _select_directional_anchor_indices(self, advantages: torch.Tensor) -> torch.Tensor:
+        advantages = advantages.detach().flatten()
+        positive_mask = advantages > 0.0
+        if not positive_mask.any():
+            return torch.empty(0, dtype=torch.long, device=advantages.device)
+
+        positive_advantages = advantages[positive_mask]
+        threshold = torch.quantile(positive_advantages, self.directional_advantage_quantile)
+        anchor_mask = positive_mask & (advantages >= threshold)
+        anchor_indices = anchor_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        if anchor_indices.numel() > self.directional_max_groups:
+            topk = torch.topk(advantages[anchor_indices], k=self.directional_max_groups).indices
+            anchor_indices = anchor_indices[topk]
+
+        return anchor_indices
+
+    def _compute_directional_diversity_loss(
+        self,
+        obs_batch: TensorDict,
+        actions_batch: torch.Tensor,
+        advantages_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        zero = self.new_method(actions_batch)
+        if self.lambda_dir <= 0.0:
+            return zero
+
+        anchor_indices = self._select_directional_anchor_indices(torch.squeeze(advantages_batch, -1))
+        if anchor_indices.numel() == 0:
+            return zero
+
+        anchor_obs = obs_batch[anchor_indices]
+        anchor_actions = actions_batch[anchor_indices]
+
+        action_samples = [anchor_actions]
+        with torch.no_grad():
+            for _ in range(self.directional_num_samples - 1):
+                # The extra actions are treated as fixed samples so the inverse-latent term still
+                # produces a gradient on the current flow parameters.
+                action_samples.append(self.policy.act_inference(anchor_obs).detach())
+
+        sampled_actions = torch.stack(action_samples, dim=1)
+        repeated_obs = self._repeat_observations(anchor_obs, self.directional_num_samples)
+        latent_batch = self.policy.inverse_latent(sampled_actions.flatten(0, 1), repeated_obs)
+        latent_batch = latent_batch.view(anchor_actions.shape[0], self.directional_num_samples, -1)
+
+        directions = latent_batch / (latent_batch.norm(dim=-1, keepdim=True) + self.directional_eps)
+        cosine_sq = torch.matmul(directions, directions.transpose(-1, -2)).square()
+        diag_mask = torch.eye(
+            self.directional_num_samples, device=cosine_sq.device, dtype=torch.bool
+        ).unsqueeze(0)
+        cosine_sq = cosine_sq.masked_fill(diag_mask, 0.0)
+
+        num_pairs = self.directional_num_samples * (self.directional_num_samples - 1)
+        return (cosine_sq.sum(dim=(-1, -2)) / num_pairs).mean()
+
+    def new_method(self, actions_batch):
+        zero = actions_batch.new_zeros(())
+        return zero
 
     def update(self) -> dict[str, float]:  # noqa: C901
-        if self.clip_param <= 0.0:
-            raise ValueError("SGenPO requires 'clip_param' > 0 because SPO surrogate divides by it.")
-
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         mean_compress_loss = 0.0
+        mean_directional_loss = 0.0
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_symmetry_loss = 0.0 if self.symmetry else None
 
@@ -88,10 +188,11 @@ class SGenPO(GenPO):
                         param_group["lr"] = self.learning_rate
 
             ratio = torch.exp(log_ratio_batch)
-            advantages = torch.squeeze(advantages_batch)
-            surrogate = advantages * ratio
-            trust_region_penalty = torch.abs(advantages) * torch.square(ratio - 1.0) / (3.0 * self.clip_param)
-            surrogate_loss = -(surrogate - trust_region_penalty).mean()
+            surrogate = -torch.squeeze(advantages_batch) * ratio
+            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            )
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -111,10 +212,16 @@ class SGenPO(GenPO):
             else:
                 compress_loss = surrogate_loss.new_zeros(())
 
+            directional_loss = self._compute_directional_diversity_loss(obs_batch, actions_batch, advantages_batch)
             action_log_prob_batch = self._log_prob_from_latent(new_action_latent_batch)
             entropy = -((action_log_prob_batch).detach() * action_log_prob_batch).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss + self.compress_coef * compress_loss
+            loss = (
+                surrogate_loss
+                + self.value_loss_coef * value_loss
+                + self.compress_coef * compress_loss
+                + self.lambda_dir * directional_loss
+            )
 
             if self.symmetry:
                 if not self.symmetry["use_data_augmentation"]:
@@ -168,6 +275,7 @@ class SGenPO(GenPO):
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.item()
             mean_compress_loss += compress_loss.item()
+            mean_directional_loss += directional_loss.item()
 
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -179,6 +287,7 @@ class SGenPO(GenPO):
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_compress_loss /= num_updates
+        mean_directional_loss /= num_updates
 
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -192,6 +301,7 @@ class SGenPO(GenPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "compress": mean_compress_loss,
+            "directional": mean_directional_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
