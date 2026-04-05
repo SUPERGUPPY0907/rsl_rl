@@ -19,6 +19,7 @@ class GenPOPlusPlus(GenPO):
         self,
         policy,
         lambda_dir: float = 0.0,
+        lambda_mirror: float = 0.0,
         directional_num_samples: int = 4,
         directional_advantage_quantile: float = 0.75,
         directional_max_groups: int = 32,
@@ -29,6 +30,8 @@ class GenPOPlusPlus(GenPO):
 
         if lambda_dir < 0.0:
             raise ValueError(f"'lambda_dir' must be non-negative, got {lambda_dir}.")
+        if lambda_mirror < 0.0:
+            raise ValueError(f"'lambda_mirror' must be non-negative, got {lambda_mirror}.")
         if directional_num_samples < 2:
             raise ValueError(
                 f"'directional_num_samples' must be at least 2, got {directional_num_samples}."
@@ -44,10 +47,18 @@ class GenPOPlusPlus(GenPO):
             raise ValueError(f"'directional_eps' must be positive, got {directional_eps}.")
 
         self.lambda_dir = lambda_dir
+        self.lambda_mirror = lambda_mirror
         self.directional_num_samples = directional_num_samples
         self.directional_advantage_quantile = directional_advantage_quantile
         self.directional_max_groups = directional_max_groups
         self.directional_eps = directional_eps
+
+        self.gipo_sigma = 1.0
+        self.rho_min = 1e-4
+        self.rho_max = 1e4
+
+        self.tau_pos = 1.0
+        self.tau_neg = 1.05
 
     def _repeat_observations(self, obs: TensorDict, repeats: int) -> TensorDict:
         if repeats < 1:
@@ -112,6 +123,32 @@ class GenPOPlusPlus(GenPO):
         num_pairs = self.directional_num_samples * (self.directional_num_samples - 1)
         return (cosine_sq.sum(dim=(-1, -2)) / num_pairs).mean()
 
+    def _compute_mirrored_action_loss(
+        self,
+        obs_batch: TensorDict,
+        actions_batch: torch.Tensor,
+        advantages_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        zero = self.new_method(actions_batch)
+        if self.lambda_mirror <= 0.0:
+            return zero
+
+        advantages = torch.squeeze(advantages_batch, -1).detach()
+        anchor_indices = self._select_directional_anchor_indices(advantages)
+        if anchor_indices.numel() == 0:
+            return zero
+
+        anchor_obs = obs_batch[anchor_indices]
+        anchor_actions = actions_batch[anchor_indices]
+        anchor_advantages = advantages[anchor_indices]
+
+        anchor_latents = self.policy.inverse_latent(anchor_actions, anchor_obs)
+        mirrored_actions = self.policy.forward_latent(-anchor_latents, anchor_obs)
+        per_sample_loss = (mirrored_actions - anchor_actions.detach()).pow(2).mean(dim=-1)
+        weights = anchor_advantages / (anchor_advantages.mean() + self.directional_eps)
+
+        return (weights * per_sample_loss).mean()
+
     def new_method(self, actions_batch):
         zero = actions_batch.new_zeros(())
         return zero
@@ -122,6 +159,7 @@ class GenPOPlusPlus(GenPO):
         mean_entropy = 0.0
         mean_compress_loss = 0.0
         mean_directional_loss = 0.0
+        mean_mirrored_loss = 0.0
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_symmetry_loss = 0.0 if self.symmetry else None
 
@@ -188,11 +226,24 @@ class GenPOPlusPlus(GenPO):
                         param_group["lr"] = self.learning_rate
 
             ratio = torch.exp(log_ratio_batch)
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            adv = torch.squeeze(advantages_batch, -1)
+            tau = torch.where(
+                adv > 0,
+                torch.full_like(ratio, self.tau_pos),
+                torch.full_like(ratio, self.tau_neg),
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # Use the original ratio where PPO would not clip, and SAPO soft clipping where it would.
+            soft_factor = (4.0 / tau) * torch.sigmoid(tau * (ratio - 1.0))
+            hard_factor = torch.zeros_like(ratio)
+            keep_factor = torch.ones_like(ratio)
+            use_clip = ((adv > 0) & (ratio > 1.0 + self.clip_param)) | (
+                (adv < 0) & (ratio < 1.0 - self.clip_param)
+            )
+            effective_factor = torch.where(use_clip, hard_factor, ratio)
+            surrogate_loss = -(adv * effective_factor).mean()
+            # weight = torch.exp(-0.5 * (torch.log(ratio_for_weight) / self.gipo_sigma) ** 2)
+            # effective_multiplier = weight * ratio
+            # surrogate_loss = -(effective_multiplier * adv).mean()
 
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -213,6 +264,7 @@ class GenPOPlusPlus(GenPO):
                 compress_loss = surrogate_loss.new_zeros(())
 
             directional_loss = self._compute_directional_diversity_loss(obs_batch, actions_batch, advantages_batch)
+            mirrored_loss = self._compute_mirrored_action_loss(obs_batch, actions_batch, advantages_batch)
             action_log_prob_batch = self._log_prob_from_latent(new_action_latent_batch)
             entropy = -((action_log_prob_batch).detach() * action_log_prob_batch).mean()
 
@@ -221,6 +273,7 @@ class GenPOPlusPlus(GenPO):
                 + self.value_loss_coef * value_loss
                 + self.compress_coef * compress_loss
                 + self.lambda_dir * directional_loss
+                + self.lambda_mirror * mirrored_loss
             )
 
             if self.symmetry:
@@ -276,6 +329,7 @@ class GenPOPlusPlus(GenPO):
             mean_entropy += entropy.item()
             mean_compress_loss += compress_loss.item()
             mean_directional_loss += directional_loss.item()
+            mean_mirrored_loss += mirrored_loss.item()
 
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -288,6 +342,7 @@ class GenPOPlusPlus(GenPO):
         mean_entropy /= num_updates
         mean_compress_loss /= num_updates
         mean_directional_loss /= num_updates
+        mean_mirrored_loss /= num_updates
 
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -302,6 +357,7 @@ class GenPOPlusPlus(GenPO):
             "entropy": mean_entropy,
             "compress": mean_compress_loss,
             "directional": mean_directional_loss,
+            "mirrored": mean_mirrored_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

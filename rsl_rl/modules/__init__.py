@@ -6,6 +6,7 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
+from .actor_critic_belm_genpo import ActorCriticBELMGenPO
 from .actor_critic_genpo import ActorCriticGenPO
 from .actor_critic_leapfrog import ActorCriticLeapfrog
 from .actor_critic_moser import ActorCriticMoser
@@ -17,6 +18,7 @@ from .symmetry import resolve_symmetry_config
 
 __all__ = [
     "ActorCritic",
+    "ActorCriticBELMGenPO",
     "ActorCriticGenPO",
     "ActorCriticLeapfrog",
     "ActorCriticMoser",

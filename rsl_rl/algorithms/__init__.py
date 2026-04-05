@@ -6,12 +6,26 @@
 """Implementation of different learning algorithms."""
 
 from .distillation import Distillation
+from .belm_genpo import BELMGenPO
 from .genpo import GenPO
 from .genpo_plus_plus import GenPOPlusPlus
+from .genpo_pushforward_clip import GenPOPFClip, GenPOU0Clip
 from .leapfrogppo import LeapfrogPPO
 from .ppo import PPO
 from .ppo_moser import MoserPPO
 from .sgenpo import SGenPO
 from .spo import SPO
 
-__all__ = ["PPO", "SPO", "GenPO", "GenPOPlusPlus", "SGenPO", "LeapfrogPPO", "MoserPPO", "Distillation"]
+__all__ = [
+    "PPO",
+    "SPO",
+    "BELMGenPO",
+    "GenPO",
+    "GenPOPFClip",
+    "GenPOPlusPlus",
+    "GenPOU0Clip",
+    "SGenPO",
+    "LeapfrogPPO",
+    "MoserPPO",
+    "Distillation",
+]

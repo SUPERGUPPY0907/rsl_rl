@@ -11,9 +11,10 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import GenPO, GenPOPlusPlus, PPO, SGenPO
+from rsl_rl.algorithms import BELMGenPO, GenPO, GenPOPFClip, GenPOPlusPlus, GenPOU0Clip, PPO, SGenPO
 from rsl_rl.modules import (
     ActorCritic,
+    ActorCriticBELMGenPO,
     ActorCriticGenPO,
     ActorCriticRecurrent,
     resolve_rnd_config,
@@ -26,14 +27,19 @@ class OnPolicyFlowRunner(OnPolicyRunner):
     """On-policy runner with flow-aware algorithm/policy construction."""
 
     _alg_registry = {
+        "BELMGenPO": BELMGenPO,
         "GenPO": GenPO,
+        "GenPOPFClip": GenPOPFClip,
         "SGenPO": SGenPO,
         "GenPOPlusPlus": GenPOPlusPlus,
+        "GenPOU0Clip": GenPOU0Clip,
         "GenPO++": GenPOPlusPlus,
         "genpo++": GenPOPlusPlus,
     }
 
-    def _construct_algorithm(self, obs: TensorDict) -> GenPO | SGenPO | GenPOPlusPlus:
+    def _construct_algorithm(
+        self, obs: TensorDict
+    ) -> BELMGenPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus:
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
 
@@ -54,9 +60,15 @@ class OnPolicyFlowRunner(OnPolicyRunner):
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic |  ActorCriticGenPO | ActorCriticRecurrent = actor_critic_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, device = self.device, **self.policy_cfg
-        ).to(self.device)
+        actor_critic: ActorCritic | ActorCriticBELMGenPO | ActorCriticGenPO | ActorCriticRecurrent = (
+            actor_critic_class(
+                obs,
+                self.cfg["obs_groups"],
+                self.env.num_actions,
+                device=self.device,
+                **self.policy_cfg,
+            ).to(self.device)
+        )
 
         # Initialize the algorithm
         alg_name = self.alg_cfg.pop("class_name")
@@ -64,7 +76,7 @@ class OnPolicyFlowRunner(OnPolicyRunner):
         if alg_class is None:
             alg_class = eval(alg_name)
 
-        alg: GenPO | SGenPO | GenPOPlusPlus = alg_class(
+        alg: BELMGenPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus = alg_class(
             actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 

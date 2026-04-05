@@ -13,13 +13,21 @@ from typing import Any, NoReturn
 from rsl_rl.networks import EmpiricalNormalization, MLP
 from rsl_rl.utils import resolve_nn_activation
 
-from .genpo.flow import Flow
+from .genpo.flow import BELMFlow
 
 
-class ActorCriticGenPO(nn.Module):
-    """Actor-critic module with a flow-based actor over augmented actions [a, v]."""
+class ActorCriticBELMGenPO(nn.Module):
+    """Actor-critic module with a BELM-style actor over augmented actions [x0, x1]."""
 
     is_recurrent: bool = False
+    diagnostic_names = (
+        "a_term_norm",
+        "b_term_norm",
+        "eps_term_norm",
+        "x_prev_norm",
+        "latent_norm",
+        "dummy_gap_norm",
+    )
 
     def __init__(
         self,
@@ -29,7 +37,11 @@ class ActorCriticGenPO(nn.Module):
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         flow_num_steps: int = 5,
-        mix_para: float = 0.95,
+        a_coeff: float | None = None,
+        b_coeff: float | None = None,
+        eps_coeff: float | None = None,
+        lag_coeff: float | None = None,
+        mix_para: float | None = None,
         std: float = 1.0,
         time_dim: int = 32,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
@@ -38,12 +50,12 @@ class ActorCriticGenPO(nn.Module):
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
-        device = torch.device("cpu"),
+        device: str | torch.device = torch.device("cpu"),
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
             print(
-                "ActorCriticFlow.__init__ got unexpected arguments, which will be ignored: "
+                "ActorCriticBELMGenPO.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs])
             )
         super().__init__()
@@ -52,21 +64,31 @@ class ActorCriticGenPO(nn.Module):
 
         num_actor_obs = 0
         for obs_group in obs_groups["policy"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCriticFlow module only supports 1D observations."
+            assert len(obs[obs_group].shape) == 2, "The ActorCriticBELMGenPO module only supports 1D observations."
             num_actor_obs += obs[obs_group].shape[-1]
 
         num_critic_obs = 0
         for obs_group in obs_groups["critic"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCriticFlow module only supports 1D observations."
+            assert len(obs[obs_group].shape) == 2, "The ActorCriticBELMGenPO module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
 
         self.action_dim = num_actions
         self.full_action_dim = num_actions * 2
-        self. device= device
+        self.device = device
 
         activation_mod = resolve_nn_activation(activation)
+        resolved_a_coeff, resolved_b_coeff, resolved_eps_coeff = BELMFlow.resolve_coefficients(
+            a_coeff=a_coeff,
+            b_coeff=b_coeff,
+            eps_coeff=eps_coeff,
+            lag_coeff=lag_coeff,
+            mix_para=mix_para,
+        )
+        self._a_coeff = resolved_a_coeff
+        self._b_coeff = resolved_b_coeff
+        self._eps_coeff = resolved_eps_coeff
 
-        self.actor = Flow(
+        self.actor = BELMFlow(
             input_dim=num_actor_obs + self.action_dim,
             output_dim=self.action_dim,
             a_dim=self.action_dim,
@@ -75,7 +97,9 @@ class ActorCriticGenPO(nn.Module):
             time_hidden_dim=time_hidden_dims,
             activation=activation_mod,
             n_steps=flow_num_steps,
-            mix_coeff=mix_para,
+            a_coeff=resolved_a_coeff,
+            b_coeff=resolved_b_coeff,
+            eps_coeff=resolved_eps_coeff,
             device=self.device,
         )
 
@@ -106,6 +130,9 @@ class ActorCriticGenPO(nn.Module):
 
         self.ip_std = std
         self.last_latents: torch.Tensor | None = None
+        self._track_inverse_diagnostics = False
+        self._diagnostic_updates = 0
+        self._diagnostic_totals = {name: 0.0 for name in self.diagnostic_names}
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
@@ -125,14 +152,26 @@ class ActorCriticGenPO(nn.Module):
     def entropy(self) -> NoReturn:
         raise NotImplementedError
 
+    @property
+    def a_coeff(self) -> float:
+        return self._a_coeff
+
+    @property
+    def b_coeff(self) -> float:
+        return self._b_coeff
+
+    @property
+    def eps_coeff(self) -> float:
+        return self._eps_coeff
+
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
         actions, latents = self.actor.sample_with_latent(actor_obs)
         self.last_latents = latents
         return actions
-    
-    def inverse(self, actions: torch.tensor, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
+
+    def inverse(self, actions: torch.Tensor, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
         log_probs = self.actor.inverse(actor_obs, actions)
@@ -141,7 +180,16 @@ class ActorCriticGenPO(nn.Module):
     def inverse_latent(self, actions: torch.Tensor, obs: TensorDict) -> torch.Tensor:
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        return self.actor.inverse_latent(actor_obs, actions)
+        latent = self.actor.inverse_latent(
+            actor_obs,
+            actions,
+            track_diagnostics=self._track_inverse_diagnostics,
+        )
+        if self._track_inverse_diagnostics and self.actor.last_inverse_diagnostics is not None:
+            for name, value in self.actor.last_inverse_diagnostics.items():
+                self._diagnostic_totals[name] += float(value.item())
+            self._diagnostic_updates += 1
+        return latent
 
     def forward_latent(self, latent: torch.Tensor, obs: TensorDict) -> torch.Tensor:
         actor_obs = self.get_actor_obs(obs)
@@ -184,6 +232,25 @@ class ActorCriticGenPO(nn.Module):
             critic_obs = self.get_critic_obs(obs)
             self.critic_obs_normalizer.update(critic_obs)
 
+    def begin_diagnostic_accumulation(self) -> None:
+        self._track_inverse_diagnostics = True
+        self._diagnostic_updates = 0
+        self._diagnostic_totals = {name: 0.0 for name in self.diagnostic_names}
+
+    def end_diagnostic_accumulation(self) -> dict[str, float]:
+        self._track_inverse_diagnostics = False
+        num_updates = max(1, self._diagnostic_updates)
+        diagnostics = {
+            name: self._diagnostic_totals[name] / num_updates
+            for name in self.diagnostic_names
+        }
+        self._diagnostic_updates = 0
+        self._diagnostic_totals = {name: 0.0 for name in self.diagnostic_names}
+        return diagnostics
+
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         super().load_state_dict(state_dict, strict=strict)
+        self._a_coeff = self.actor.a_coeff
+        self._b_coeff = self.actor.b_coeff
+        self._eps_coeff = self.actor.eps_coeff
         return True

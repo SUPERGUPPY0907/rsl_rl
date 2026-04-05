@@ -3,6 +3,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-from .flow import Flow, MLP, MLP_L, SinusoidalPosEmb
+from .flow import BELMFlow, Flow, MLP, MLP_L, SinusoidalPosEmb
 
-__all__ = ["Flow", "MLP", "MLP_L", "SinusoidalPosEmb"]
+__all__ = ["BELMFlow", "Flow", "MLP", "MLP_L", "SinusoidalPosEmb"]
