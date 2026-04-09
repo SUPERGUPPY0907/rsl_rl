@@ -13,6 +13,7 @@ from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCriticGenPO
+from rsl_rl.modules.ema import ExponentialMovingAverage
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -43,6 +44,10 @@ class GenPO:
         desired_kl: float = 0.01,
         device: str = "cpu",
         normalize_advantage_per_mini_batch: bool = False,
+        trust_region_mode: str = "ppo",
+        storage_latent_noise_std: float = 0.0,
+        ema_decay: float = 0.0,
+        ema_warmup_steps: int = 500,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -61,6 +66,15 @@ class GenPO:
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
+
+        if trust_region_mode not in {"ppo", "spo", "aspo"}:
+            raise ValueError(f"Unsupported trust-region mode: {trust_region_mode}.")
+        if trust_region_mode in {"spo", "aspo"} and clip_param <= 0.0:
+            raise ValueError("GenPO trust-region mode 'spo'/'aspo' requires 'clip_param' > 0.")
+        if storage_latent_noise_std < 0.0:
+            raise ValueError(
+                f"'storage_latent_noise_std' must be non-negative, got {storage_latent_noise_std}."
+            )
 
         # RND components
         if rnd_cfg is not None:
@@ -124,6 +138,15 @@ class GenPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.trust_region_mode = trust_region_mode
+        self.storage_latent_noise_std = storage_latent_noise_std
+        self.ema_decay = ema_decay
+        self.ema_warmup_steps = ema_warmup_steps
+        self.tot_timesteps = 0
+        if ema_decay > 0.0:
+            self.ema = ExponentialMovingAverage(self.policy.actor, decay=ema_decay, device=self.device)
+        else:
+            self.ema = None
 
     def _latent_sq_norm(self, latent: torch.Tensor) -> torch.Tensor:
         return latent.square().sum(dim=-1)
@@ -133,6 +156,36 @@ class GenPO:
 
     def _log_prob_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
         return -0.5 * self._latent_sq_norm(latent) - 0.5 * latent.shape[-1] * math.log(2.0 * math.pi)
+
+    def _surrogate_loss_from_log_ratio(
+        self, log_ratio_batch: torch.Tensor, advantages_batch: torch.Tensor
+    ) -> torch.Tensor:
+        ratio = torch.exp(log_ratio_batch)
+        advantages = torch.squeeze(advantages_batch, -1)
+
+        if self.trust_region_mode == "ppo":
+            surrogate = -advantages * ratio
+            surrogate_clipped = -advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            return torch.max(surrogate, surrogate_clipped).mean()
+
+        spo_loss = -(
+            ratio * advantages - torch.abs(advantages) / (2.0 * self.clip_param) * (ratio - 1.0).pow(2)
+        )
+        if self.trust_region_mode == "spo":
+            return spo_loss.mean()
+
+        surrogate = -advantages * ratio
+        surrogate_clipped = -advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+        ppo_loss = torch.max(surrogate, surrogate_clipped)
+        return torch.where(advantages > 0.0, ppo_loss, spo_loss).mean()
+
+    def _sample_storage_action_and_latent(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        actions_full = self.policy.act(obs).detach()
+        action_latent = self.policy.get_actions_latent(actions_full).detach()
+        if self.storage_latent_noise_std > 0.0:
+            action_latent = action_latent + self.storage_latent_noise_std * torch.randn_like(action_latent)
+            actions_full = self.policy.forward_latent(action_latent, obs).detach()
+        return actions_full, action_latent
 
     def get_storage_action_shape(self, num_env_actions: int) -> list[int]:
         return [num_env_actions * 2]
@@ -162,10 +215,10 @@ class GenPO:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
 
-        actions_full = self.policy.act(obs).detach()
+        actions_full, action_latent = self._sample_storage_action_and_latent(obs)
         self.transition.actions = actions_full
         self.transition.values = self.policy.evaluate(obs).detach()
-        self.transition.action_latent = self.policy.get_actions_latent(actions_full).detach()
+        self.transition.action_latent = action_latent
         self.transition.observations = obs
 
         return 0.5 * actions_full[..., : self.policy.action_dim] + 0.5 * actions_full[..., self.policy.action_dim :]
@@ -286,13 +339,7 @@ class GenPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
-            ratio = torch.exp(log_ratio_batch)
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_loss = self._surrogate_loss_from_log_ratio(log_ratio_batch, advantages_batch)
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -393,6 +440,7 @@ class GenPO:
             mean_symmetry_loss /= num_updates
 
         self.storage.clear()
+        self.tot_timesteps += 1
 
         loss_dict = {
             "value_function": mean_value_loss,
@@ -406,6 +454,32 @@ class GenPO:
             loss_dict["symmetry"] = mean_symmetry_loss
 
         return loss_dict
+
+    def post_update(self) -> None:
+        if self.ema is None:
+            return
+        if self.tot_timesteps == self.ema_warmup_steps:
+            self.ema.reset_to_current()
+        elif self.tot_timesteps > self.ema_warmup_steps:
+            self.ema.update()
+
+    def get_checkpoint_policy_state_dict(self) -> dict[str, torch.Tensor]:
+        model_state_dict = {name: tensor.detach().clone() for name, tensor in self.policy.state_dict().items()}
+        if self.ema is not None and self.tot_timesteps > self.ema_warmup_steps:
+            for name, ema_param in self.ema.shadow_params.items():
+                full_name = f"actor.{name}"
+                if full_name in model_state_dict:
+                    model_state_dict[full_name] = ema_param.detach().clone().to(model_state_dict[full_name].device)
+        return model_state_dict
+
+    def get_additional_checkpoint_state(self) -> dict[str, object]:
+        if self.ema is None:
+            return {}
+        return {"ema_state_dict": self.ema.state_dict()}
+
+    def load_additional_checkpoint_state(self, loaded_dict: dict[str, object]) -> None:
+        if self.ema is not None and "ema_state_dict" in loaded_dict:
+            self.ema.load_state_dict(loaded_dict["ema_state_dict"])
 
 
     def broadcast_parameters(self) -> None:

@@ -25,10 +25,10 @@ class BELMGenPO(GenPO):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
 
-        actions_full = self.policy.act(obs).detach()
+        actions_full, action_latent = self._sample_storage_action_and_latent(obs)
         self.transition.actions = actions_full
         self.transition.values = self.policy.evaluate(obs).detach()
-        self.transition.action_latent = self.policy.get_actions_latent(actions_full).detach()
+        self.transition.action_latent = action_latent
         self.transition.observations = obs
 
         return actions_full[..., : self.policy.action_dim]
