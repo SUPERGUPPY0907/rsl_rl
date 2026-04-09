@@ -7,6 +7,7 @@
 
 from .distillation import Distillation
 from .belm_genpo import BELMGenPO
+from .fpo import FPO
 from .genpo import GenPO
 from .genpo_plus_plus import GenPOPlusPlus
 from .genpo_pushforward_clip import GenPOPFClip, GenPOU0Clip
@@ -20,6 +21,7 @@ __all__ = [
     "PPO",
     "SPO",
     "BELMGenPO",
+    "FPO",
     "GenPO",
     "GenPOPFClip",
     "GenPOPlusPlus",

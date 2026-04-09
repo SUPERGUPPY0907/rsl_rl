@@ -11,10 +11,11 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import BELMGenPO, GenPO, GenPOPFClip, GenPOPlusPlus, GenPOU0Clip, PPO, SGenPO
+from rsl_rl.algorithms import BELMGenPO, FPO, GenPO, GenPOPFClip, GenPOPlusPlus, GenPOU0Clip, PPO, SGenPO
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticBELMGenPO,
+    ActorCriticFPO,
     ActorCriticGenPO,
     ActorCriticRecurrent,
     resolve_rnd_config,
@@ -28,6 +29,7 @@ class OnPolicyFlowRunner(OnPolicyRunner):
 
     _alg_registry = {
         "BELMGenPO": BELMGenPO,
+        "FPO": FPO,
         "GenPO": GenPO,
         "GenPOPFClip": GenPOPFClip,
         "SGenPO": SGenPO,
@@ -35,11 +37,13 @@ class OnPolicyFlowRunner(OnPolicyRunner):
         "GenPOU0Clip": GenPOU0Clip,
         "GenPO++": GenPOPlusPlus,
         "genpo++": GenPOPlusPlus,
+        "FPO++": FPO,
+        "fpo++": FPO,
     }
 
     def _construct_algorithm(
         self, obs: TensorDict
-    ) -> BELMGenPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus:
+    ) -> BELMGenPO | FPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus:
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
 
@@ -60,7 +64,7 @@ class OnPolicyFlowRunner(OnPolicyRunner):
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticBELMGenPO | ActorCriticGenPO | ActorCriticRecurrent = (
+        actor_critic: ActorCritic | ActorCriticBELMGenPO | ActorCriticFPO | ActorCriticGenPO | ActorCriticRecurrent = (
             actor_critic_class(
                 obs,
                 self.cfg["obs_groups"],
@@ -76,7 +80,7 @@ class OnPolicyFlowRunner(OnPolicyRunner):
         if alg_class is None:
             alg_class = eval(alg_name)
 
-        alg: BELMGenPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus = alg_class(
+        alg: BELMGenPO | FPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus = alg_class(
             actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
@@ -150,7 +154,11 @@ class OnPolicyFlowRunner(OnPolicyRunner):
 
         # Log losses
         for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+            if isinstance(value, dict):
+                for metric_name, metric_value in value.items():
+                    self.writer.add_scalar(f"Metrics/{metric_name}", metric_value, locs["it"])
+            else:
+                self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
         # Log noise std only if available
@@ -188,7 +196,11 @@ class OnPolicyFlowRunner(OnPolicyRunner):
             if mean_std is not None:
                 log_string += f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
             for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+                if isinstance(value, dict):
+                    for metric_name, metric_value in value.items():
+                        log_string += f"""{f"{metric_name}:":>{pad}} {metric_value:.4f}\n"""
+                else:
+                    log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
             if hasattr(self.alg, "rnd") and self.alg.rnd:
                 log_string += (
                     f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(locs["erewbuffer"]):.2f}\n"""
@@ -206,7 +218,11 @@ class OnPolicyFlowRunner(OnPolicyRunner):
             if mean_std is not None:
                 log_string += f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
             for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+                if isinstance(value, dict):
+                    for metric_name, metric_value in value.items():
+                        log_string += f"""{f"{metric_name}:":>{pad}} {metric_value:.4f}\n"""
+                else:
+                    log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
 
         log_string += ep_string
         log_string += (

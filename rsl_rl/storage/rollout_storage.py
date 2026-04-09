@@ -26,6 +26,10 @@ class RolloutStorage:
             self.action_latent: torch.Tensor | None = None
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
+            self.initial_cfm_loss: torch.Tensor | None = None
+            self.x1_pred: torch.Tensor | None = None
+            self.cfm_loss_eps: torch.Tensor | None = None
+            self.cfm_loss_t: torch.Tensor | None = None
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
 
         def clear(self) -> None:
@@ -39,6 +43,7 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
+        n_samples_per_action: int | None = None,
     ) -> None:
         self.training_type = training_type
         self.device = device
@@ -61,7 +66,7 @@ class RolloutStorage:
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
         # For reinforcement learning
-        if training_type in {"rl", "rl_genpo"}:
+        if training_type in {"rl", "rl_genpo", "rl_fpo"}:
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
@@ -70,8 +75,39 @@ class RolloutStorage:
                 self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
                 self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
                 self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            else:
+            elif training_type == "rl_genpo":
                 self.action_latent = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+            else:
+                if n_samples_per_action is None:
+                    raise ValueError("'n_samples_per_action' is required for FPO rollout storage.")
+                self.n_samples_per_action = n_samples_per_action
+                self.initial_cfm_loss = torch.zeros(
+                    num_transitions_per_env,
+                    num_envs,
+                    n_samples_per_action,
+                    device=self.device,
+                )
+                self.cfm_loss_eps = torch.zeros(
+                    num_transitions_per_env,
+                    num_envs,
+                    n_samples_per_action,
+                    *actions_shape,
+                    device=self.device,
+                )
+                self.cfm_loss_t = torch.zeros(
+                    num_transitions_per_env,
+                    num_envs,
+                    n_samples_per_action,
+                    1,
+                    device=self.device,
+                )
+                self.x1_pred = torch.zeros(
+                    num_transitions_per_env,
+                    num_envs,
+                    n_samples_per_action,
+                    *actions_shape,
+                    device=self.device,
+                )
 
         # For RNN networks
         self.saved_hidden_state_a = None
@@ -96,14 +132,19 @@ class RolloutStorage:
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
 
         # For reinforcement learning
-        if self.training_type in {"rl", "rl_genpo"}:
+        if self.training_type in {"rl", "rl_genpo", "rl_fpo"}:
             self.values[self.step].copy_(transition.values)
             if self.training_type == "rl":
                 self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
                 self.mu[self.step].copy_(transition.action_mean)
                 self.sigma[self.step].copy_(transition.action_sigma)
-            else:
+            elif self.training_type == "rl_genpo":
                 self.action_latent[self.step].copy_(transition.action_latent)
+            else:
+                self.initial_cfm_loss[self.step].copy_(transition.initial_cfm_loss)
+                self.cfm_loss_eps[self.step].copy_(transition.cfm_loss_eps)
+                self.cfm_loss_t[self.step].copy_(transition.cfm_loss_t)
+                self.x1_pred[self.step].copy_(transition.x1_pred)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -168,7 +209,7 @@ class RolloutStorage:
 
     # For reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
-        if self.training_type not in {"rl", "rl_genpo"}:
+        if self.training_type not in {"rl", "rl_genpo", "rl_fpo"}:
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
@@ -186,8 +227,13 @@ class RolloutStorage:
             old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
             old_mu = self.mu.flatten(0, 1)
             old_sigma = self.sigma.flatten(0, 1)
-        else:
+        elif self.training_type == "rl_genpo":
             old_action_latent = self.action_latent.flatten(0, 1)
+        else:
+            old_cfm_loss = self.initial_cfm_loss.flatten(0, 1)
+            old_cfm_eps = self.cfm_loss_eps.flatten(0, 1)
+            old_cfm_t = self.cfm_loss_t.flatten(0, 1)
+            old_x1_pred = self.x1_pred.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -206,8 +252,13 @@ class RolloutStorage:
                     old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
                     old_mu_batch = old_mu[batch_idx]
                     old_sigma_batch = old_sigma[batch_idx]
-                else:
+                elif self.training_type == "rl_genpo":
                     old_action_latent_batch = old_action_latent[batch_idx]
+                else:
+                    old_cfm_loss_batch = old_cfm_loss[batch_idx]
+                    old_cfm_eps_batch = old_cfm_eps[batch_idx]
+                    old_cfm_t_batch = old_cfm_t[batch_idx]
+                    old_x1_pred_batch = old_x1_pred[batch_idx]
 
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
@@ -230,7 +281,7 @@ class RolloutStorage:
                         ),
                         masks_batch,
                     )
-                else:  # rl_genpo
+                elif self.training_type == "rl_genpo":
                     yield (
                         obs_batch,
                         actions_batch,
@@ -244,11 +295,30 @@ class RolloutStorage:
                         ),
                         masks_batch,
                     )
+                else:  # rl_fpo
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        target_values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_x1_pred_batch,
+                        old_cfm_loss_batch,
+                        old_cfm_eps_batch,
+                        old_cfm_t_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                    )
 
     # For reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
-        if self.training_type not in {"rl", "rl_genpo"}:
+        if self.training_type not in {"rl", "rl_genpo", "rl_fpo"}:
             raise ValueError("This function is only available for reinforcement learning training.")
+        if self.training_type == "rl_fpo":
+            raise ValueError("FPO rollout storage does not support recurrent policies.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
 
         mini_batch_size = self.num_envs // num_mini_batches

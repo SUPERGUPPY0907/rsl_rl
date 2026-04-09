@@ -54,6 +54,7 @@ class OnPolicyRunner:
         # Logging
         self.log_dir = log_dir
         self.writer = None
+        self.logger_type = self.cfg.get("logger", "tensorboard").lower()
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
@@ -146,6 +147,8 @@ class OnPolicyRunner:
 
             # Update policy
             loss_dict = self.alg.update()
+            if hasattr(self.alg, "post_update"):
+                self.alg.post_update()
 
             stop = time.time()
             learn_time = stop - start
@@ -289,13 +292,19 @@ class OnPolicyRunner:
         print(log_string)
 
     def save(self, path: str, infos: dict | None = None) -> None:
+        if hasattr(self.alg, "get_checkpoint_policy_state_dict"):
+            model_state_dict = self.alg.get_checkpoint_policy_state_dict()
+        else:
+            model_state_dict = self.alg.policy.state_dict()
         # Save model
         saved_dict = {
-            "model_state_dict": self.alg.policy.state_dict(),
+            "model_state_dict": model_state_dict,
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        if hasattr(self.alg, "get_additional_checkpoint_state"):
+            saved_dict.update(self.alg.get_additional_checkpoint_state())
         # Save RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -310,6 +319,8 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        if hasattr(self.alg, "load_additional_checkpoint_state"):
+            self.alg.load_additional_checkpoint_state(loaded_dict)
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
@@ -437,9 +448,6 @@ class OnPolicyRunner:
         """Prepare the logging writers."""
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune or Tensorboard summary writer, default: Tensorboard.
-            self.logger_type = self.cfg.get("logger", "tensorboard")
-            self.logger_type = self.logger_type.lower()
-
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
 

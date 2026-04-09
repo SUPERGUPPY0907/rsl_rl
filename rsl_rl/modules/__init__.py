@@ -7,6 +7,7 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_belm_genpo import ActorCriticBELMGenPO
+from .actor_critic_fpo import ActorCriticFPO
 from .actor_critic_genpo import ActorCriticGenPO
 from .actor_critic_leapfrog import ActorCriticLeapfrog
 from .actor_critic_moser import ActorCriticMoser
@@ -19,6 +20,7 @@ from .symmetry import resolve_symmetry_config
 __all__ = [
     "ActorCritic",
     "ActorCriticBELMGenPO",
+    "ActorCriticFPO",
     "ActorCriticGenPO",
     "ActorCriticLeapfrog",
     "ActorCriticMoser",
