@@ -11,6 +11,7 @@ from .actor_critic_fpo import ActorCriticFPO
 from .actor_critic_genpo import ActorCriticGenPO
 from .actor_critic_leapfrog import ActorCriticLeapfrog
 from .actor_critic_moser import ActorCriticMoser
+from .actor_critic_policyflow import ActorCriticPolicyFlow
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .student_teacher import StudentTeacher
@@ -24,6 +25,7 @@ __all__ = [
     "ActorCriticGenPO",
     "ActorCriticLeapfrog",
     "ActorCriticMoser",
+    "ActorCriticPolicyFlow",
     "ActorCriticRecurrent",
     "RandomNetworkDistillation",
     "StudentTeacher",

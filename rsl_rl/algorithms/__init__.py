@@ -12,6 +12,7 @@ from .genpo import GenPO
 from .genpo_plus_plus import GenPOPlusPlus
 from .genpo_pushforward_clip import GenPOPFClip, GenPOU0Clip
 from .leapfrogppo import LeapfrogPPO
+from .policyflow import PolicyFlow
 from .ppo import PPO
 from .ppo_moser import MoserPPO
 from .sgenpo import SGenPO
@@ -29,5 +30,6 @@ __all__ = [
     "SGenPO",
     "LeapfrogPPO",
     "MoserPPO",
+    "PolicyFlow",
     "Distillation",
 ]

@@ -1,0 +1,55 @@
+runner:
+  class_name: OnPolicyFlowRunner
+  num_steps_per_env: 24
+  max_iterations: 40000
+  seed: 1
+  obs_groups: {"policy": ["policy"], "critic": ["policy", "privileged"]}
+  save_interval: 100
+  experiment_name: policyflow_experiment
+  run_name: ""
+  logger: tensorboard
+  neptune_project: legged_gym
+  wandb_project: legged_gym
+
+  policy:
+    class_name: ActorCriticPolicyFlow
+    actor_obs_normalization: false
+    critic_obs_normalization: false
+    actor_hidden_dims: [512, 256, 128]
+    actor_activations: [elu, elu, elu, linear]
+    critic_hidden_dims: [512, 256, 128]
+    critic_activations: [elu, elu, elu, linear]
+    flow_embedding_dim: 64
+    flow_conditioning: linear
+    flow_sample_steps: 10
+    flow_sample_step_schedule: uniform_continuous
+    flow_timestep_embedding_type: fourier
+    flow_interpolation_type: rectified_flow
+    flow_use_ema: false
+    flow_ema_rate: 0.995
+    variance_std_init: 1.0
+    variance_log_std_min: -20.0
+    variance_log_std_max: 4.0
+
+  algorithm:
+    class_name: PolicyFlow
+    desired_kl: 0.01
+    learning_rate: 1.0e-4
+    discount_factor: 0.99
+    lam: 0.95
+    time_limit_bootstrap: true
+    mini_batches: 4
+    learning_epochs: 5
+    gaussian_entropy_loss_scale: 0.0025
+    brownian_reg_loss_scale: 0.0025
+    ratio_clip: 0.2
+    clip_predicted_values: true
+    value_clip: 0.2
+    value_loss_scale: 1.0
+    grad_norm_clip: 1.0
+    degenerate2gaussian: false
+    optimizer: adamw
+    optimizer_kwargs:
+      weight_decay: 1.0e-5
+    learning_rate_scheduler_kwargs:
+      kl_threshold: 0.01

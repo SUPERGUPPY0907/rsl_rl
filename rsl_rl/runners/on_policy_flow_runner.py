@@ -11,12 +11,13 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import BELMGenPO, FPO, GenPO, GenPOPFClip, GenPOPlusPlus, GenPOU0Clip, PPO, SGenPO
+from rsl_rl.algorithms import BELMGenPO, FPO, GenPO, GenPOPFClip, GenPOPlusPlus, GenPOU0Clip, PPO, PolicyFlow, SGenPO
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticBELMGenPO,
     ActorCriticFPO,
     ActorCriticGenPO,
+    ActorCriticPolicyFlow,
     ActorCriticRecurrent,
     resolve_rnd_config,
     resolve_symmetry_config,
@@ -39,11 +40,12 @@ class OnPolicyFlowRunner(OnPolicyRunner):
         "genpo++": GenPOPlusPlus,
         "FPO++": FPO,
         "fpo++": FPO,
+        "PolicyFlow": PolicyFlow,
     }
 
     def _construct_algorithm(
         self, obs: TensorDict
-    ) -> BELMGenPO | FPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus:
+    ) -> BELMGenPO | FPO | GenPO | GenPOPFClip | GenPOU0Clip | PolicyFlow | SGenPO | GenPOPlusPlus:
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
 
@@ -64,7 +66,7 @@ class OnPolicyFlowRunner(OnPolicyRunner):
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticBELMGenPO | ActorCriticFPO | ActorCriticGenPO | ActorCriticRecurrent = (
+        actor_critic: ActorCritic | ActorCriticBELMGenPO | ActorCriticFPO | ActorCriticGenPO | ActorCriticPolicyFlow | ActorCriticRecurrent = (
             actor_critic_class(
                 obs,
                 self.cfg["obs_groups"],
@@ -80,7 +82,7 @@ class OnPolicyFlowRunner(OnPolicyRunner):
         if alg_class is None:
             alg_class = eval(alg_name)
 
-        alg: BELMGenPO | FPO | GenPO | GenPOPFClip | GenPOU0Clip | SGenPO | GenPOPlusPlus = alg_class(
+        alg: BELMGenPO | FPO | GenPO | GenPOPFClip | GenPOU0Clip | PolicyFlow | SGenPO | GenPOPlusPlus = alg_class(
             actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
